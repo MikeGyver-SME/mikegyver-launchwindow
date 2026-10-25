@@ -1,0 +1,303 @@
+name: Build and upload Launch Window to TestFlight
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   ASC_KEY_ID     App Store Connect API key ID (e.g. A1B2C3D4E5)
+#   ASC_ISSUER_ID  Issuer ID (UUID from the API key page)
+#   ASC_KEY_P8     Full contents of the downloaded AuthKey_XXXX.p8 file
+#   TEAM_ID        Your Apple Developer Team ID (Membership details page)
+#
+# Signing strategy: xcodebuild's -allowProvisioningUpdates does not pick up
+# API-key auth on Xcode 26 ("No Account for Team"), so fastlane drives
+# signing instead: `cert` mints the Apple Distribution certificate and
+# `sigh` fetches one App Store provisioning profile per bundle ID
+# (app + widget extension), then xcodegen generates the project and
+# xcodebuild archives with manual signing. The per-target
+# PROVISIONING_PROFILE_SPECIFIER settings in project.yml read the
+# profile UUIDs from the APP_PROFILE_UUID / WIDGET_PROFILE_UUID
+# environment variables, so `sigh` MUST run before `xcodegen generate`.
+jobs:
+  build:
+    runs-on: macos-26
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      TEAM_ID: ${{ secrets.TEAM_ID }}
+      APP_BUNDLE_ID: studio.mikegyver.launchwindow
+      WIDGET_BUNDLE_ID: studio.mikegyver.launchwindow.widget
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Install fastlane and XcodeGen
+        run: |
+          sudo gem install fastlane -N
+          brew install xcodegen
+
+      - name: Write App Store Connect API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/asc"
+          # Trailing newline: some PEM parsers reject a key file without one.
+          printf '%s\n' '${{ secrets.ASC_KEY_P8 }}' > "$RUNNER_TEMP/asc/AuthKey.p8"
+          chmod 600 "$RUNNER_TEMP/asc/AuthKey.p8"
+
+      - name: Validate API key
+        run: |
+          KEY="$RUNNER_TEMP/asc/AuthKey.p8"
+          echo "Key ID: $ASC_KEY_ID"
+          echo "Issuer ID: $ASC_ISSUER_ID"
+          [ -n "$ASC_KEY_ID" ] || { echo "::error::ASC_KEY_ID secret is empty."; exit 1; }
+          [ -n "$ASC_ISSUER_ID" ] || { echo "::error::ASC_ISSUER_ID secret is empty."; exit 1; }
+          [ -n "$TEAM_ID" ] || { echo "::error::TEAM_ID secret is empty."; exit 1; }
+          echo "$TEAM_ID" | grep -Eq '^[A-Z0-9]{8,16}$' || { echo "::error::TEAM_ID secret does not look like an Apple Team ID. Check for typos or extra whitespace."; exit 1; }
+          head -1 "$KEY" | grep -q "BEGIN PRIVATE KEY" || { echo "::error::ASC_KEY_P8 is malformed: missing BEGIN PRIVATE KEY header. Re-paste the .p8 file into the secret."; exit 1; }
+          tail -1 "$KEY" | grep -q "END PRIVATE KEY" || { echo "::error::ASC_KEY_P8 is malformed: missing END PRIVATE KEY footer. Re-paste the .p8 file into the secret."; exit 1; }
+          echo "API key file OK ($(wc -l < "$KEY") lines)."
+
+      - name: Create signing keychain
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/launchwindow.keychain-db"
+          PASSWORD="$(openssl rand -base64 32)"
+          echo "LAUNCHWINDOW_KEYCHAIN_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
+          echo "LAUNCHWINDOW_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          security create-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" "$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -s "$KEYCHAIN"
+          echo "Keychain ready: $KEYCHAIN"
+
+      - name: Write API key JSON for fastlane
+        run: |
+          python3 - <<'PY'
+          import os, json
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'asc', 'AuthKey.p8')) as f:
+              p8 = f.read()
+          key = {
+              "key_id": os.environ["ASC_KEY_ID"],
+              "issuer_id": os.environ["ASC_ISSUER_ID"],
+              "key": p8,
+              "in_house": False,
+          }
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'asc_key.json'), 'w') as f:
+              json.dump(key, f)
+          print('API key JSON written')
+          PY
+
+      - name: Revoke orphaned distribution certificates
+        # Ephemeral runners can't keep private keys between runs, so any
+        # Apple-side distribution cert from a previous run is unusable.
+        # Best-effort hygiene via the API so cert slots never fill up.
+        # If cleanup fails, `cert` below still works until the 3-cert limit
+        # is hit (then revoke manually in the portal) — never block the build.
+        run: |
+          ruby - <<'RUBY'
+          require 'net/http'
+          require 'uri'
+          require 'json'
+          require 'openssl'
+          require 'base64'
+
+          key_id = ENV['ASC_KEY_ID']
+          issuer_id = ENV['ASC_ISSUER_ID']
+          p8 = File.read(File.join(ENV['RUNNER_TEMP'], 'asc', 'AuthKey.p8'))
+
+          enc = ->(d) { Base64.urlsafe_encode64(d).delete('=') }
+          now = Time.now.to_i
+          input = enc.call({ 'alg' => 'ES256', 'kid' => key_id, 'typ' => 'JWT' }.to_json) +
+                  '.' + enc.call({ 'iss' => issuer_id, 'iat' => now,
+                                   'exp' => now + 600, 'aud' => 'appstoreconnect-v1' }.to_json)
+          # ES256/JWS requires the ECDSA signature as raw 64-byte R||S,
+          # not the ASN.1 DER form OpenSSL returns (Apple 401s otherwise).
+          der_sig = OpenSSL::PKey.read(p8).sign('SHA256', input)
+          r, s = OpenSSL::ASN1.decode(der_sig).value.map { |i| i.value.to_s(2).rjust(32, "\x00".b)[-32, 32] }
+          jwt = input + '.' + enc.call(r + s)
+
+          def api(jwt, method, path)
+            uri = URI("https://api.appstoreconnect.apple.com#{path}")
+            res = nil
+            3.times do |i|
+              http = Net::HTTP.new(uri.host, uri.port)
+              http.use_ssl = true
+              http.open_timeout = 15
+              http.read_timeout = 30
+              if method == :delete
+                req = Net::HTTP::Delete.new(uri.request_uri)
+              else
+                req = Net::HTTP::Get.new(uri.request_uri)
+              end
+              req['Authorization'] = "Bearer #{jwt}"
+              req['Accept'] = 'application/json'
+              res = http.request(req)
+              break unless %w[401 429 500 502 503].include?(res.code)
+              puts "HTTP #{res.code} on #{path}, retrying (#{i + 1}/3)..."
+              sleep 5
+            end
+            res
+          end
+
+          begin
+            res = api(jwt, :get, '/v1/certificates?limit=20')
+            raise "list: HTTP #{res.code}: #{res.body[0, 300]}" unless res.code == '200'
+            certs = JSON.parse(res.body)['data'].select do |c|
+              c.dig('attributes', 'certificateType') == 'DISTRIBUTION'
+            end
+            puts "Found #{certs.length} orphaned distribution certificate(s)."
+            certs.each do |c|
+              del = api(jwt, :delete, "/v1/certificates/#{c['id']}")
+              puts "Revoke #{c['id']}: HTTP #{del.code}"
+            end
+          rescue => e
+            puts "::warning::Certificate cleanup failed (best-effort, continuing): #{e.message}"
+          end
+          RUBY
+
+      - name: Create distribution certificate and provisioning profiles (app + widget)
+        run: |
+          mkdir -p "$RUNNER_TEMP/certs" "$RUNNER_TEMP/profiles"
+          fastlane cert --api_key_path "$RUNNER_TEMP/asc_key.json" \
+            --output_path "$RUNNER_TEMP/certs" \
+            --keychain_path "$LAUNCHWINDOW_KEYCHAIN" \
+            --keychain_password "$LAUNCHWINDOW_KEYCHAIN_PASSWORD"
+          for BID in "$APP_BUNDLE_ID" "$WIDGET_BUNDLE_ID"; do
+            fastlane sigh --api_key_path "$RUNNER_TEMP/asc_key.json" \
+              --app_identifier "$BID" \
+              --output_path "$RUNNER_TEMP/profiles" --force
+          done
+          for BID in "$APP_BUNDLE_ID" "$WIDGET_BUNDLE_ID"; do
+            MATCHED=""
+            for PROFILE_PATH in "$RUNNER_TEMP/profiles"/*.mobileprovision; do
+              PLIST=$(security cms -D -i "$PROFILE_PATH")
+              APPID=$(/usr/libexec/PlistBuddy -c 'Print :AppIDName' /dev/stdin <<< "$PLIST" 2>/dev/null || true)
+              ENT_APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin <<< "$PLIST" 2>/dev/null || true)
+              if [ "$APPID" = "$BID" ] || [[ "$ENT_APPID" == *"$BID" ]]; then
+                MATCHED="$PROFILE_PATH"
+                break
+              fi
+            done
+            [ -n "$MATCHED" ] || { echo "::error::No provisioning profile found for $BID."; exit 1; }
+            PLIST=$(security cms -D -i "$MATCHED")
+            UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin <<< "$PLIST")
+            NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin <<< "$PLIST")
+            echo "Profile for $BID: $NAME ($UUID)"
+            if [ "$BID" = "$APP_BUNDLE_ID" ]; then
+              echo "APP_PROFILE_UUID=$UUID" >> "$GITHUB_ENV"
+            else
+              echo "WIDGET_PROFILE_UUID=$UUID" >> "$GITHUB_ENV"
+            fi
+          done
+
+      - name: Resolve signing team from Apple
+        # The sigh profile carries Apple's authoritative team ID. Prefer it
+        # over the hand-entered TEAM_ID secret (lengths only are logged,
+        # never values). Also dumps keychain state for diagnosis.
+        run: |
+          PROFILE_PATH=$(ls "$RUNNER_TEMP/profiles"/*.mobileprovision | head -1)
+          PLIST=$(security cms -D -i "$PROFILE_PATH")
+          PROFILE_TEAM=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' /dev/stdin <<< "$PLIST")
+          [ -n "$PROFILE_TEAM" ] || { echo "::error::Could not read team ID from provisioning profile."; exit 1; }
+          echo "Profile team ID length: ${#PROFILE_TEAM}"
+          echo "TEAM_ID secret length: ${#TEAM_ID}"
+          if [ "$TEAM_ID" = "$PROFILE_TEAM" ]; then
+            echo "TEAM_ID matches Apple's team ID."
+          else
+            echo "::warning::TEAM_ID secret does not match Apple's team ID; using Apple's value."
+          fi
+          echo "EFFECTIVE_TEAM_ID=$PROFILE_TEAM" >> "$GITHUB_ENV"
+          echo "--- keychain search list ---"
+          security list-keychains -d user
+          echo "--- identities visible by default ---"
+          security find-identity -v -p codesigning | head -6
+
+      - name: Verify signing identity
+        run: |
+          echo "Identities with private keys in the CI keychain:"
+          security find-identity -v -p codesigning "$LAUNCHWINDOW_KEYCHAIN" | tee "$RUNNER_TEMP/identities.txt"
+          grep -q "Apple Distribution" "$RUNNER_TEMP/identities.txt" || { echo "::error::No Apple Distribution identity with private key found in the CI keychain."; exit 1; }
+
+      - name: Generate project (after sigh, so profile UUIDs resolve)
+        run: xcodegen generate
+
+      - name: Guard Info.plists against XcodeGen overwrite
+        # XcodeGen's `info:` block silently overwrites hand-written plists
+        # with defaults (we removed it; INFOPLIST_FILE is set explicitly).
+        # Fail fast here instead of after a full build + Apple rejection.
+        run: |
+          for PL in LaunchWindow/Info.plist LaunchWidget/Info.plist; do
+            if ! git diff --quiet -- "$PL"; then
+              echo "::error::xcodegen modified $PL - the hand-written keys were clobbered."
+              git diff -- "$PL" | head -40
+              exit 1
+            fi
+          done
+          echo "Both Info.plists untouched by XcodeGen"
+
+      - name: Verify profile UUIDs landed in the project
+        run: |
+          grep -q "$APP_PROFILE_UUID" LaunchWindow.xcodeproj/project.pbxproj || { echo "::error::APP_PROFILE_UUID not found in generated project."; exit 1; }
+          grep -q "$WIDGET_PROFILE_UUID" LaunchWindow.xcodeproj/project.pbxproj || { echo "::error::WIDGET_PROFILE_UUID not found in generated project."; exit 1; }
+          echo "Both profile UUIDs present in project.pbxproj"
+
+      - name: Archive (manual signing)
+        run: |
+          xcodebuild -project LaunchWindow.xcodeproj -scheme LaunchWindow -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/LaunchWindow.xcarchive" archive \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            DEVELOPMENT_TEAM="$EFFECTIVE_TEAM_ID"
+
+      - name: Write export options
+        run: |
+          python3 - <<'PY'
+          import os, plistlib
+          opts = {
+              'method': 'app-store',
+              'teamID': os.environ['EFFECTIVE_TEAM_ID'],
+              'signingStyle': 'manual',
+              'provisioningProfiles': {
+                  os.environ['APP_BUNDLE_ID']: os.environ['APP_PROFILE_UUID'],
+                  os.environ['WIDGET_BUNDLE_ID']: os.environ['WIDGET_PROFILE_UUID'],
+              },
+              'uploadSymbols': True,
+          }
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'exportOptions.plist'), 'wb') as f:
+              plistlib.dump(opts, f)
+          print('exportOptions.plist written (manual signing, both bundle IDs)')
+          PY
+
+      - name: Export IPA
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/LaunchWindow.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/exportOptions.plist"
+          ls -la "$RUNNER_TEMP/export"
+
+      - name: Dump built Info.plist (diagnostic)
+        run: |
+          APP_PLIST="$RUNNER_TEMP/LaunchWindow.xcarchive/Products/Applications/LaunchWindow.app/Info.plist"
+          echo "--- keys that Apple's validator checks ---"
+          plutil -p "$APP_PLIST" | grep -E "UILaunch|UIRequiresFullScreen|UISupportedInterfaceOrientations|UIDeviceFamily|MinimumOSVersion|UIBackgroundModes" || true
+
+      - name: Upload to TestFlight
+        run: |
+          fastlane pilot upload \
+            --ipa "$RUNNER_TEMP/export/LaunchWindow.ipa" \
+            --api_key_path "$RUNNER_TEMP/asc_key.json" \
+            --skip_submission \
+            --skip_waiting_for_build_processing
+
+      - name: Keep a copy of the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LaunchWindow-ipa
+          path: ${{ runner.temp }}/export/LaunchWindow.ipa
+          retention-days: 14
