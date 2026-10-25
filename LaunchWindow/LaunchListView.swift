@@ -6,14 +6,27 @@ final class LaunchListModel: ObservableObject {
     @Published var launches: [Launch] = LaunchStore.cachedLaunches
     @Published var pinnedID: String? = LaunchStore.pinnedID
     @Published var errorMessage: String?
+    @Published var statusLine: String?
     @Published var isLoading = false
 
     func refresh() async {
         isLoading = true
         defer { isLoading = false }
         do {
-            launches = try await LaunchAPI.fetchUpcoming()
+            let (newLaunches, source) = try await LaunchAPI.fetchUpcomingWithSource()
+            launches = newLaunches
             errorMessage = nil
+            // Health check never touches upstream, so it is safe to run
+            // on every refresh even while /launches is 429ing.
+            let health = await LaunchAPI.fetchHealth()
+            let sourceText = source == .worker ? "Source: Worker" : "Source: Direct (Worker failed)"
+            if let health {
+                statusLine = "\(sourceText) · \(health.summary)"
+            } else if LaunchAPI.workerBaseURL.isEmpty {
+                statusLine = "\(sourceText) · Direct mode (no Worker)"
+            } else {
+                statusLine = "\(sourceText) · Worker unreachable"
+            }
             WidgetCenter.shared.reloadAllTimelines()
         } catch {
             errorMessage = "Couldn't refresh launches. Showing cached data."
@@ -46,6 +59,9 @@ struct LaunchListView: View {
             List {
                 if let error = model.errorMessage {
                     Text(error).font(.footnote).foregroundStyle(.orange)
+                }
+                if let status = model.statusLine {
+                    Text(status).font(.footnote).foregroundStyle(.secondary)
                 }
                 ForEach(model.launches) { launch in
                     NavigationLink(value: launch) {
