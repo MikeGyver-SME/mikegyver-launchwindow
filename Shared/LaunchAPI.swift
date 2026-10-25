@@ -14,14 +14,20 @@ struct WorkerHealth: Decodable {
     let cache: String
     let cachedAt: String?
     let ttlSeconds: Int?
+    // Present on Worker builds with the 429 backoff; absent on older ones.
+    let blocked: Bool?
+    let blockedUntil: String?
 
     var summary: String {
+        let base: String
         switch cache {
-        case "fresh": return "Worker OK · fresh cache"
-        case "stale": return "Worker OK · stale cache"
-        case "empty": return "Worker OK · no cached launches yet"
-        default: return "Worker OK · cache: \(cache)"
+        case "fresh": base = "Worker OK · fresh cache"
+        case "stale": base = "Worker OK · stale cache"
+        case "empty": base = "Worker OK · no cached launches yet"
+        default: base = "Worker OK · cache: \(cache)"
         }
+        if blocked == true { return "\(base) · blocked (no upstream fetch)" }
+        return base
     }
 }
 
@@ -39,19 +45,45 @@ enum LaunchAPI {
         try await fetchUpcomingWithSource().0
     }
 
-    /// Try the Worker first, then direct LL2. The Worker is preferred
-    /// because it caches (15 min) and shields the phone's IP from
-    /// LL2's 15 req/hr unauthenticated limit, but a blocked Worker
-    /// must never be worse than no Worker at all.
+    /// Health-first, so the app never keeps the Worker blocked.
+    /// A /health check never touches LL2, so it is safe on every refresh.
+    /// - If the Worker cache is fresh, use the Worker: it serves cache
+    ///   with no upstream fetch at all, so it burns nothing.
+    /// - Otherwise (empty, stale, or Worker unreachable), use direct LL2
+    ///   first. Hitting Worker /launches when its cache is empty or stale
+    ///   would make the Worker fetch upstream and burn the shared
+    ///   Cloudflare egress IP's 15/hr budget — every app open and widget
+    ///   refresh doing that is exactly how the rolling window stays full
+    ///   forever. Only if direct fails do we try the Worker as a last
+    ///   resort, where it may serve a stale cached list.
+    /// The Worker only ever primes deliberately: a single manual
+    /// /launches hit after /throttle shows a free slot, after which
+    /// health turns fresh and the app uses the Worker again.
     static func fetchUpcomingWithSource() async throws -> ([Launch], LaunchSource) {
         if !workerBaseURL.isEmpty {
-            do {
-                let launches = try await fetchFrom(workerBaseURL + "/launches")
-                return (launches, .worker)
-            } catch {
-                // Fall through to direct LL2. The error is intentionally
-                // not surfaced here: if direct succeeds, the user gets
-                // a fresh list and the status line says so.
+            let health = await fetchHealth()
+            if health?.cache == "fresh" {
+                do {
+                    let launches = try await fetchFrom(workerBaseURL + "/launches")
+                    return (launches, .worker)
+                } catch {
+                    let launches = try await fetchFrom(ll2Direct)
+                    return (launches, .direct)
+                }
+            } else {
+                do {
+                    let launches = try await fetchFrom(ll2Direct)
+                    return (launches, .direct)
+                } catch let directError {
+                    // Last resort: the Worker may have a stale list
+                    // even though direct LL2 just failed.
+                    do {
+                        let launches = try await fetchFrom(workerBaseURL + "/launches")
+                        return (launches, .worker)
+                    } catch {
+                        throw directError
+                    }
+                }
             }
         }
         let launches = try await fetchFrom(ll2Direct)
