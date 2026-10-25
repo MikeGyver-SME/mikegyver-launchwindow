@@ -52,18 +52,28 @@ struct LL2Launch: Decodable {
         let location: Location?
     }
     struct Vid: Decodable { let url: URL? }
+    // LL2 net_precision is an OBJECT, not a string:
+    // { "id": 1, "name": "Minute", "abbrev": "MIN" }.
+    // Decoding it as String? fails every launch, which fails the
+    // whole list — that was the "Couldn't refresh launches" bug.
+    struct NetPrecision: Decodable { let name: String?; let abbrev: String? }
 
     let id: String
     let name: String
     let net: Date
-    let net_precision: String?
+    let net_precision: NetPrecision?
     let status: Status?
     let launch_service_provider: Provider?
     let rocket: Rocket?
     let mission: Mission?
     let pad: Pad?
     let image: String?
+    // LL2 uses snake_case vid_urls; keep both spellings so a stream
+    // link works whichever key the payload uses. Either one missing
+    // is fine (optional) — it just means no Watch button, not a
+    // failed list.
     let vidURLs: [Vid]?
+    let vid_urls: [Vid]?
 
     var asLaunch: Launch {
         Launch(
@@ -75,11 +85,11 @@ struct LL2Launch: Decodable {
             rocket: rocket?.configuration?.full_name ?? rocket?.configuration?.name ?? "Unknown rocket",
             missionName: mission?.name,
             missionDescription: mission?.description,
-            netPrecision: net_precision,
+            netPrecision: net_precision?.name ?? net_precision?.abbrev,
             padName: pad?.name ?? "Unknown pad",
             locationName: pad?.location?.name ?? "",
             imageURL: image.flatMap(URL.init(string:)),
-            streamURL: vidURLs?.compactMap(\.url).first
+            streamURL: vidURLs?.compactMap(\.url).first ?? vid_urls?.compactMap(\.url).first
         )
     }
 }
