@@ -6,7 +6,6 @@ struct Launch: Codable, Identifiable, Hashable {
     let id: String
     let name: String
     let net: Date
-    let net_precision: String?
     let statusAbbrev: String
     let provider: String
     let rocket: String
@@ -74,9 +73,9 @@ struct LL2Launch: Decodable {
             statusAbbrev: status?.abbrev ?? "TBD",
             provider: launch_service_provider?.name ?? "Unknown",
             rocket: rocket?.configuration?.full_name ?? rocket?.configuration?.name ?? "Unknown rocket",
-            netPrecision: net_precision,
             missionName: mission?.name,
             missionDescription: mission?.description,
+            netPrecision: net_precision,
             padName: pad?.name ?? "Unknown pad",
             locationName: pad?.location?.name ?? "",
             imageURL: image.flatMap(URL.init(string:)),

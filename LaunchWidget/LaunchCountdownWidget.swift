@@ -43,9 +43,9 @@ struct LaunchProvider: TimelineProvider {
     static let sample = Launch(
         id: "sample", name: "Falcon 9 Block 5 | Starlink Group 10-5",
         net: .now.addingTimeInterval(2 * 86_400 + 4 * 3_600),
-        netPrecision: "Day",
         statusAbbrev: "Go", provider: "SpaceX", rocket: "Falcon 9 Block 5",
         missionName: "Starlink Group 10-5", missionDescription: nil,
+        netPrecision: "Day",
         padName: "SLC-40", locationName: "Cape Canaveral, FL, USA",
         imageURL: nil, streamURL: nil)
 }
